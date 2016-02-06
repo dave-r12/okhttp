@@ -22,17 +22,25 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.Flushable;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
+import java.nio.channels.OverlappingFileLockException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import okhttp3.internal.io.FileLock;
 import okhttp3.internal.io.FileSystem;
 import okio.Buffer;
 import okio.BufferedSink;
@@ -86,6 +94,7 @@ public final class DiskLruCache implements Closeable, Flushable {
   static final String JOURNAL_FILE = "journal";
   static final String JOURNAL_FILE_TEMP = "journal.tmp";
   static final String JOURNAL_FILE_BACKUP = "journal.bkp";
+  static final String JOURNAL_FILE_LOCK = "journal.lock";
   static final String MAGIC = "libcore.io.DiskLruCache";
   static final String VERSION_1 = "1";
   static final long ANY_SEQUENCE_NUMBER = -1;
@@ -135,11 +144,46 @@ public final class DiskLruCache implements Closeable, Flushable {
      * it exists when the cache is opened.
      */
 
+  static final class CacheDirectoryReference extends WeakReference<DiskLruCache> {
+    final File journalLockFile;
+    CacheDirectoryReference(DiskLruCache referent) {
+      super(referent);
+      this.journalLockFile = referent.journalFileLock;
+    }
+  }
+
+  /** Guarded by the DiskLruCache.class instance. */
+  private static final Set<CacheDirectoryReference> instances = new HashSet<>();
+  private static final Map<File, FileLock> cacheDirectoriesInUse = new HashMap<>();
+
+    /**
+     * In an effort to help our users from inadvertently misconfiguring their cache, we detect if a
+     * user has pointed multiple instances of the DiskLruCache at the same directory. Broadly
+     * speaking, there are 2 scenarios:
+     * - A user creates multiple instances of DiskLruCache within the same VM and points them both
+     * at the same directory.
+     * - A user creates multiple processes which use DiskLruCache and point at the same directory.
+     *
+     * We use the following strategy to detect competing access at initialization time:
+     * 1. Check if the cache directory is already in use by maintaining a mapping from a cache
+     * directory to a file lock. If it's already in use, we explode.
+     * 2. Attempt to create a lock file in the cache directory if it's not already present. This
+     * action can fail and we let that propagate out.
+     * 3. Attempt to acquire an exclusive file lock on the lock file. If we can't obtain a lock we
+     * explode.
+     * 4. When the cache is closed or the VM terminates, the exclusive lock is released.
+     *
+     * In addition, we guard against an application that leaks a DiskLruCache instance. We will
+     * silently release the exclusive file lock to allow a new DiskLruCache to become the owner of
+     * the directory.
+     */
+
   private final FileSystem fileSystem;
   private final File directory;
   private final File journalFile;
   private final File journalFileTmp;
   private final File journalFileBackup;
+  private final File journalFileLock;
   private final int appVersion;
   private long maxSize;
   private final int valueCount;
@@ -189,6 +233,7 @@ public final class DiskLruCache implements Closeable, Flushable {
     this.journalFile = new File(directory, JOURNAL_FILE);
     this.journalFileTmp = new File(directory, JOURNAL_FILE_TEMP);
     this.journalFileBackup = new File(directory, JOURNAL_FILE_BACKUP);
+    this.journalFileLock = new File(directory, JOURNAL_FILE_LOCK);
     this.valueCount = valueCount;
     this.maxSize = maxSize;
     this.executor = executor;
@@ -201,34 +246,90 @@ public final class DiskLruCache implements Closeable, Flushable {
       return; // Already initialized.
     }
 
-    // If a bkp file exists, use it instead.
-    if (fileSystem.exists(journalFileBackup)) {
-      // If journal file also exists just delete backup file.
+    acquireExclusiveJournalLock();
+
+    try {
+      // If a bkp file exists, use it instead.
+      if (fileSystem.exists(journalFileBackup)) {
+        // If journal file also exists just delete backup file.
+        if (fileSystem.exists(journalFile)) {
+          fileSystem.delete(journalFileBackup);
+        } else {
+          fileSystem.rename(journalFileBackup, journalFile);
+        }
+      }
+
+      // Prefer to pick up where we left off.
       if (fileSystem.exists(journalFile)) {
-        fileSystem.delete(journalFileBackup);
-      } else {
-        fileSystem.rename(journalFileBackup, journalFile);
+        try {
+          readJournal();
+          processJournal();
+          initialized = true;
+          return;
+        } catch (IOException journalIsCorrupt) {
+          Platform.get().logW("DiskLruCache " + directory + " is corrupt: "
+              + journalIsCorrupt.getMessage() + ", removing");
+          delete();
+          closed = false;
+        }
+      }
+
+      rebuildJournal();
+
+      initialized = true;
+    } finally {
+      if (!initialized) {
+        releaseExclusiveJournalLock(journalFileLock);
       }
     }
+  }
 
-    // Prefer to pick up where we left off.
-    if (fileSystem.exists(journalFile)) {
+  private void acquireExclusiveJournalLock() throws IOException {
+    synchronized (DiskLruCache.class) {
+      // if the application leaked a DiskLruCache, we'll silently release the exclusive file lock
+      Iterator<CacheDirectoryReference> itr = instances.iterator();
+      while (itr.hasNext()) {
+        CacheDirectoryReference reference = itr.next();
+        if (reference.get() == null
+            && cacheDirectoriesInUse.containsKey(reference.journalLockFile)) {
+          Internal.logger.warning("A cache instance using the directory "
+              + reference.journalLockFile.getParent() + " was not properly closed. Be sure to "
+              + "close the cache.");
+          releaseExclusiveJournalLock(reference.journalLockFile);
+          itr.remove();
+        }
+      }
+
+      if (cacheDirectoriesInUse.containsKey(journalFileLock)) {
+        throw new IllegalStateException("multiple instances of DiskLruCache are using this "
+            + "cache directory simultaneously: " + directory);
+      }
+
+      // try to acquire the exclusive lock
       try {
-        readJournal();
-        processJournal();
-        initialized = true;
-        return;
-      } catch (IOException journalIsCorrupt) {
-        Platform.get().logW("DiskLruCache " + directory + " is corrupt: "
-            + journalIsCorrupt.getMessage() + ", removing");
-        delete();
-        closed = false;
+        FileLock fileLock = fileSystem.acquireExclusiveLock(journalFileLock);
+        if (fileLock == null) {
+          throw new IllegalStateException("multiple processes are using DiskLruCache and "
+              + "configured for the same cache directory: " + directory);
+        }
+        cacheDirectoriesInUse.put(journalFileLock, fileLock);
+        instances.add(new CacheDirectoryReference(this));
+      } catch (OverlappingFileLockException e) {
+        // this will happen if multiple copies of OkHttp are loaded into the same VM and they
+        // both try to acquire an exclusive lock for the same directory. Note that because of the
+        // semantics of FileLock, the original valid FileLock could now become invalid. See the
+        // FileLock javadoc for further information.
+        throw new IllegalStateException("multiple copies of OkHttp have been loaded and are both "
+            + "trying to use this cache directory simultaneously: " + directory);
       }
     }
+  }
 
-    rebuildJournal();
+  private void releaseExclusiveJournalLock(File journalLockFile) {
+    assert Thread.holdsLock(DiskLruCache.class);
 
-    initialized = true;
+    FileLock fileLock = cacheDirectoriesInUse.remove(journalLockFile);
+    fileLock.release();
   }
 
   /**
@@ -647,6 +748,9 @@ public final class DiskLruCache implements Closeable, Flushable {
     trimToSize();
     journalWriter.close();
     journalWriter = null;
+    synchronized (DiskLruCache.class) {
+      releaseExclusiveJournalLock(journalFileLock);
+    }
     closed = true;
   }
 

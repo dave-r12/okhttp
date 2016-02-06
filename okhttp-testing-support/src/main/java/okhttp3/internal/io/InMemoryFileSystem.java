@@ -38,6 +38,7 @@ public final class InMemoryFileSystem implements FileSystem, TestRule {
   private final Map<File, Buffer> files = new LinkedHashMap<>();
   private final Map<Source, File> openSources = new IdentityHashMap<>();
   private final Map<Sink, File> openSinks = new IdentityHashMap<>();
+  private final Map<File, FileLock> fileLocks = new LinkedHashMap<>();
 
   @Override public Statement apply(final Statement base, Description description) {
     return new Statement() {
@@ -134,5 +135,20 @@ public final class InMemoryFileSystem implements FileSystem, TestRule {
       File file = i.next();
       if (file.toString().startsWith(prefix)) i.remove();
     }
+  }
+
+  @Override public FileLock acquireExclusiveLock(final File file) throws IOException {
+    if (fileLocks.containsKey(file)) {
+      return null;
+    }
+
+    FileLock fileLock = new FileLock() {
+      @Override public void release() {
+        fileLocks.remove(file);
+      }
+    };
+
+    fileLocks.put(file, fileLock);
+    return fileLock;
   }
 }

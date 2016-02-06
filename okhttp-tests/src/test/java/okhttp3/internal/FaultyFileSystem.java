@@ -20,6 +20,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import okhttp3.internal.io.FileLock;
 import okhttp3.internal.io.FileSystem;
 import okio.Buffer;
 import okio.ForwardingSink;
@@ -72,6 +73,10 @@ public final class FaultyFileSystem implements FileSystem {
 
   @Override public void deleteContents(File directory) throws IOException {
     delegate.deleteContents(directory);
+  }
+
+  @Override public FileLock acquireExclusiveLock(File file) throws IOException {
+    return delegate.acquireExclusiveLock(file);
   }
 
   private class FaultySink extends ForwardingSink {

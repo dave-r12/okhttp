@@ -17,10 +17,15 @@ package okhttp3.internal.io;
 
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+
 import okio.Okio;
 import okio.Sink;
 import okio.Source;
+
+import static okhttp3.internal.Util.closeQuietly;
 
 /**
  * Access to read and write files on a hierarchical data store. Most callers should use the {@link
@@ -100,6 +105,26 @@ public interface FileSystem {
         }
       }
     }
+
+    @Override public FileLock acquireExclusiveLock(File file) throws IOException {
+      file.createNewFile();
+      FileLock fileLock = null;
+      FileOutputStream fileOutputStream = null;
+      try {
+        fileOutputStream = new FileOutputStream(file);
+        FileChannel fileChannel = fileOutputStream.getChannel();
+        java.nio.channels.FileLock nioFileLock = fileChannel.tryLock();
+        if (nioFileLock != null) {
+          // successfully acquired an exclusive lock
+          fileLock = new FileLock.NioFileLock(nioFileLock);
+        }
+      } finally {
+        if (fileLock == null) {
+          closeQuietly(fileOutputStream);
+        }
+      }
+      return fileLock;
+    }
   };
 
   /** Reads from {@code file}. */
@@ -134,4 +159,10 @@ public interface FileSystem {
    * not be deleted, or if {@code dir} is not a readable directory.
    */
   void deleteContents(File directory) throws IOException;
+
+  /**
+   * Acquires an exclusive lock on {@code file}. Returns a file lock if successful, otherwise
+   * returns null.
+   * */
+  FileLock acquireExclusiveLock(File file) throws IOException;
 }
