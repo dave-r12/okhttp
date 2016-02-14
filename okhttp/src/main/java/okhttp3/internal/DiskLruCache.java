@@ -33,6 +33,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import okhttp3.internal.io.FileSystem;
+import okhttp3.internal.io.LockAcquirer;
 import okio.Buffer;
 import okio.BufferedSink;
 import okio.BufferedSource;
@@ -85,6 +86,7 @@ public final class DiskLruCache implements Closeable, Flushable {
   static final String JOURNAL_FILE = "journal";
   static final String JOURNAL_FILE_TEMP = "journal.tmp";
   static final String JOURNAL_FILE_BACKUP = "journal.bkp";
+  static final String JOURNAL_FILE_LOCK = "journal.lock";
   static final String MAGIC = "libcore.io.DiskLruCache";
   static final String VERSION_1 = "1";
   static final long ANY_SEQUENCE_NUMBER = -1;
@@ -139,6 +141,7 @@ public final class DiskLruCache implements Closeable, Flushable {
   private final File journalFile;
   private final File journalFileTmp;
   private final File journalFileBackup;
+  private final File journalFileLock;
   private final int appVersion;
   private long maxSize;
   private final int valueCount;
@@ -188,6 +191,7 @@ public final class DiskLruCache implements Closeable, Flushable {
     this.journalFile = new File(directory, JOURNAL_FILE);
     this.journalFileTmp = new File(directory, JOURNAL_FILE_TEMP);
     this.journalFileBackup = new File(directory, JOURNAL_FILE_BACKUP);
+    this.journalFileLock = new File(directory, JOURNAL_FILE_LOCK);
     this.valueCount = valueCount;
     this.maxSize = maxSize;
     this.executor = executor;
@@ -200,34 +204,43 @@ public final class DiskLruCache implements Closeable, Flushable {
       return; // Already initialized.
     }
 
-    // If a bkp file exists, use it instead.
-    if (fileSystem.exists(journalFileBackup)) {
-      // If journal file also exists just delete backup file.
+    LockAcquirer lockAcquirer = Platform.get().lockAcquirer();
+    lockAcquirer.acquire(journalFileLock);
+
+    try {
+      // If a bkp file exists, use it instead.
+      if (fileSystem.exists(journalFileBackup)) {
+        // If journal file also exists just delete backup file.
+        if (fileSystem.exists(journalFile)) {
+          fileSystem.delete(journalFileBackup);
+        } else {
+          fileSystem.rename(journalFileBackup, journalFile);
+        }
+      }
+
+      // Prefer to pick up where we left off.
       if (fileSystem.exists(journalFile)) {
-        fileSystem.delete(journalFileBackup);
-      } else {
-        fileSystem.rename(journalFileBackup, journalFile);
+        try {
+          readJournal();
+          processJournal();
+          initialized = true;
+          return;
+        } catch (IOException journalIsCorrupt) {
+          Platform.get().logW("DiskLruCache " + directory + " is corrupt: "
+              + journalIsCorrupt.getMessage() + ", removing");
+          delete();
+          closed = false;
+        }
+      }
+
+      rebuildJournal();
+
+      initialized = true;
+    } finally {
+      if (!initialized) {
+        lockAcquirer.release(journalFileLock);
       }
     }
-
-    // Prefer to pick up where we left off.
-    if (fileSystem.exists(journalFile)) {
-      try {
-        readJournal();
-        processJournal();
-        initialized = true;
-        return;
-      } catch (IOException journalIsCorrupt) {
-        Platform.get().logW("DiskLruCache " + directory + " is corrupt: "
-            + journalIsCorrupt.getMessage() + ", removing");
-        delete();
-        closed = false;
-      }
-    }
-
-    rebuildJournal();
-
-    initialized = true;
   }
 
   /**
@@ -646,6 +659,7 @@ public final class DiskLruCache implements Closeable, Flushable {
     trimToSize();
     journalWriter.close();
     journalWriter = null;
+    Platform.get().lockAcquirer().release(journalFileLock);
     closed = true;
   }
 

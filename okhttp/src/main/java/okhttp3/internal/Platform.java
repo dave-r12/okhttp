@@ -32,6 +32,9 @@ import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
 import okhttp3.Protocol;
+import okhttp3.internal.io.AndroidLockAcquirer;
+import okhttp3.internal.io.LockAcquirer;
+import okhttp3.internal.io.RealLockAcquirer;
 import okhttp3.internal.tls.AndroidTrustRootIndex;
 import okhttp3.internal.tls.RealTrustRootIndex;
 import okhttp3.internal.tls.TrustRootIndex;
@@ -68,6 +71,8 @@ import static okhttp3.internal.Internal.logger;
  */
 public class Platform {
   private static final Platform PLATFORM = findPlatform();
+
+  protected LockAcquirer lockAcquirer;
 
   public static Platform get() {
     return PLATFORM;
@@ -128,6 +133,13 @@ public class Platform {
 
   public void log(String message) {
     System.out.println(message);
+  }
+
+  public synchronized LockAcquirer lockAcquirer() {
+    if (lockAcquirer == null) {
+      lockAcquirer = new RealLockAcquirer();
+    }
+    return lockAcquirer;
   }
 
   /** Attempt to match the host runtime to a capable Platform implementation. */
@@ -283,6 +295,13 @@ public class Platform {
           i = end;
         } while (i < newline);
       }
+    }
+
+    @Override public synchronized LockAcquirer lockAcquirer() {
+      if (lockAcquirer == null) {
+        lockAcquirer = new AndroidLockAcquirer();
+      }
+      return lockAcquirer;
     }
   }
 
